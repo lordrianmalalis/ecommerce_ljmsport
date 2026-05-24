@@ -41,6 +41,67 @@ const CAT_SIZES = {
 // Local cache for current session
 let _stockCache = {};  // { productId: { size: qty } }
 
+// ══════════════════════════════════════════════════════════
+//  SESSION (sessionStorage — survives refresh, clears on tab close)
+//  sessionStorage is scoped to the tab and never shared across
+//  tabs or persisted after the browser session ends, making it
+//  more appropriate than localStorage for admin auth state.
+// ══════════════════════════════════════════════════════════
+const SESSION_KEY    = 'ljm_admin_session';
+const SESSION_TTL_MS = 8 * 60 * 60 * 1000; // 8 hours
+
+function _setSession(account) {
+  const session = { admin: account, expiresAt: Date.now() + SESSION_TTL_MS };
+  sessionStorage.setItem(SESSION_KEY, JSON.stringify(session));
+}
+
+function _clearSession() {
+  sessionStorage.removeItem(SESSION_KEY);
+}
+
+/** Returns the current admin if session is still valid, otherwise null. */
+function getSession() {
+  try {
+    const raw = sessionStorage.getItem(SESSION_KEY);
+    if (!raw) return null;
+    const session = JSON.parse(raw);
+    if (Date.now() > session.expiresAt) { _clearSession(); return null; }
+    return session.admin;
+  } catch (e) { _clearSession(); return null; }
+}
+
+/** Call at the start of any privileged realtime callback. */
+function requireAuth() {
+  if (!currentAdmin) return null;   // not logged in at all — skip silently
+  const admin = getSession();
+  if (!admin) { adminLogout(); return null; }  // session expired while logged in
+  return admin;
+}
+
+// ── SHA-256 helper (matches customer password hashing) ───
+async function sha256(str) {
+  const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(str));
+  return Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2, '0')).join('');
+}
+
+// ══════════════════════════════════════════════════════════
+//  RBAC — pages visible per role
+// ══════════════════════════════════════════════════════════
+const ROLE_PAGES = {
+  owner   : ['dashboard','orders','riders','products','customers','feedbacks','payments'],
+  manager : ['dashboard','orders','riders','products','customers','feedbacks'],
+  staff   : ['dashboard','orders'],
+};
+
+function applyRBAC(role) {
+  const allowed = ROLE_PAGES[role] || ['dashboard'];
+  document.querySelectorAll('.nav-item[onclick]').forEach(item => {
+    const match = item.getAttribute('onclick').match(/'([a-z]+)'/);
+    const page  = match ? match[1] : null;
+    if (page) item.style.display = allowed.includes(page) ? '' : 'none';
+  });
+}
+
 async function loadAllStock() {
   _stockCache = await db_getAllStock();
 }
@@ -222,66 +283,6 @@ function flashNewOrderBanner(count) {
   banner.innerHTML = `<span>🛒 ${count} new order${count > 1 ? 's' : ''} from the shop!</span><button onclick="showPage('orders',null);this.parentElement.remove()" style="background:#000;color:var(--accent);border:none;padding:4px 10px;border-radius:2px;cursor:pointer;font-weight:700;font-size:12px">VIEW →</button><button onclick="this.parentElement.remove()" style="background:none;border:none;cursor:pointer;font-size:16px;color:#000">✕</button>`;
   document.body.appendChild(banner);
   setTimeout(() => { if (banner.parentElement) banner.remove(); }, 7000);
-}
-
-// ══════════════════════════════════════════════════════════
-//  SESSION (sessionStorage — survives refresh, clears on tab close)
-//  sessionStorage is scoped to the tab and never shared across
-//  tabs or persisted after the browser session ends, making it
-//  more appropriate than localStorage for admin auth state.
-// ══════════════════════════════════════════════════════════
-const SESSION_KEY    = 'ljm_admin_session';
-const SESSION_TTL_MS = 8 * 60 * 60 * 1000; // 8 hours
-
-function _setSession(account) {
-  const session = { admin: account, expiresAt: Date.now() + SESSION_TTL_MS };
-  sessionStorage.setItem(SESSION_KEY, JSON.stringify(session));
-}
-
-function _clearSession() {
-  sessionStorage.removeItem(SESSION_KEY);
-}
-
-/** Returns the current admin if session is still valid, otherwise null. */
-function getSession() {
-  try {
-    const raw = sessionStorage.getItem(SESSION_KEY);
-    if (!raw) return null;
-    const session = JSON.parse(raw);
-    if (Date.now() > session.expiresAt) { _clearSession(); return null; }
-    return session.admin;
-  } catch { _clearSession(); return null; }
-}
-
-/** Call at the start of any privileged operation. Auto-logs out if expired. */
-function requireAuth() {
-  const admin = getSession();
-  if (!admin) { adminLogout(); return null; }
-  return admin;
-}
-
-// ── SHA-256 helper (matches customer password hashing) ───
-async function sha256(str) {
-  const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(str));
-  return Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2, '0')).join('');
-}
-
-// ══════════════════════════════════════════════════════════
-//  RBAC — pages visible per role
-// ══════════════════════════════════════════════════════════
-const ROLE_PAGES = {
-  owner   : ['dashboard','orders','riders','products','customers','feedbacks','payments'],
-  manager : ['dashboard','orders','riders','products','customers','feedbacks'],
-  staff   : ['dashboard','orders'],
-};
-
-function applyRBAC(role) {
-  const allowed = ROLE_PAGES[role] || ['dashboard'];
-  document.querySelectorAll('.nav-item[onclick]').forEach(item => {
-    const match = item.getAttribute('onclick').match(/'([a-z]+)'/);
-    const page  = match ? match[1] : null;
-    if (page) item.style.display = allowed.includes(page) ? '' : 'none';
-  });
 }
 
 // ══════════════════════════════════════════════════════════

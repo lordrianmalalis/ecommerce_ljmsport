@@ -122,7 +122,7 @@ function _buildRevenueChart() {
 // ══════════════════════════════════════════════════════════
 function startSync() {
   db_subscribe('orders', async (payload) => {
-    if (!currentAdmin) return;
+    if (!requireAuth()) return;
     const prevPending = ORDERS.filter(o => o.status === 'pending').length;
     await loadOrders();
     const newPending  = ORDERS.filter(o => o.status === 'pending').length;
@@ -135,28 +135,33 @@ function startSync() {
   });
 
   db_subscribe('riders', async () => {
-    if (!currentAdmin) return;
+    if (!requireAuth()) return;
     const page = _activePage();
     if (page === 'riders')    renderRiders();
     if (page === 'dashboard') renderDashboard();
   });
 
   db_subscribe('products', async () => {
-    if (!currentAdmin) return;
+    if (!requireAuth()) return;
     await loadAdminProducts();
     const page = _activePage();
     if (page === 'products') renderProductGrid();
   });
 
   db_subscribe('stock', async () => {
-    if (!currentAdmin) return;
+    if (!requireAuth()) return;
     await loadAllStock();
     const page = _activePage();
     if (page === 'products') { renderProductGrid(); renderStockTable(); }
+    // Auto-refresh the stock modal if it's currently open
+    if (currentStockProductId !== null &&
+        !document.getElementById('stock-modal-overlay').classList.contains('hidden')) {
+      openStockModal(currentStockProductId);
+    }
   });
 
   db_subscribe('payments', async () => {
-    if (!currentAdmin) return;
+    if (!requireAuth()) return;
     allPayments = await db_getPayments();
     if (_activePage() === 'payments') renderPayments();
   });
@@ -164,10 +169,11 @@ function startSync() {
   // Watch admins table so permission changes take effect live
   db_subscribe('admins', async () => {
     ADMIN_ACCOUNTS = await db_getAdmins();
-    if (currentAdmin) {
-      const refreshed = ADMIN_ACCOUNTS.find(a => a.username === currentAdmin.username);
+    const session = getSession();
+    if (session) {
+      const refreshed = ADMIN_ACCOUNTS.find(a => a.username === session.username);
       if (!refreshed) { adminLogout(); showToast('Your account was removed', 'error'); }
-      else currentAdmin = refreshed;
+      else { currentAdmin = refreshed; _session.admin = refreshed; applyRBAC(refreshed.role); }
     }
   });
 }
@@ -198,6 +204,61 @@ function flashNewOrderBanner(count) {
 }
 
 // ══════════════════════════════════════════════════════════
+//  SESSION (in-memory only — no localStorage, no JWTs stored)
+//  A lightweight session object with a hard expiry timestamp.
+//  If the tab is idle past SESSION_TTL_MS the next action that
+//  calls requireAuth() will force a logout automatically.
+// ══════════════════════════════════════════════════════════
+const SESSION_TTL_MS = 8 * 60 * 60 * 1000; // 8 hours
+let _session = null; // { admin, expiresAt }
+
+function _setSession(account) {
+  _session = { admin: account, expiresAt: Date.now() + SESSION_TTL_MS };
+}
+
+function _clearSession() {
+  _session = null;
+}
+
+/** Returns the current admin if session is still valid, otherwise null. */
+function getSession() {
+  if (!_session) return null;
+  if (Date.now() > _session.expiresAt) { _clearSession(); return null; }
+  return _session.admin;
+}
+
+/** Call at the start of any privileged operation. Auto-logs out if expired. */
+function requireAuth() {
+  const admin = getSession();
+  if (!admin) { adminLogout(); return null; }
+  return admin;
+}
+
+// ── SHA-256 helper (matches customer password hashing) ───
+async function sha256(str) {
+  const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(str));
+  return Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2, '0')).join('');
+}
+
+// ══════════════════════════════════════════════════════════
+//  RBAC — pages visible per role
+// ══════════════════════════════════════════════════════════
+const ROLE_PAGES = {
+  owner   : ['dashboard','orders','riders','products','customers','feedbacks','payments'],
+  manager : ['dashboard','orders','riders','products','customers','feedbacks'],
+  staff   : ['dashboard','orders'],
+};
+
+function applyRBAC(role) {
+  const allowed = ROLE_PAGES[role] || ['dashboard'];
+  document.querySelectorAll('.nav-item[onclick]').forEach(item => {
+    const match = item.getAttribute('onclick').match(/'([a-z]+)'/);
+    const page  = match ? match[1] : null;
+    if (page) item.style.display = allowed.includes(page) ? '' : 'none';
+  });
+}
+
+// ══════════════════════════════════════════════════════════
 //  LOGIN / LOGOUT
 // ══════════════════════════════════════════════════════════
 async function adminLogin() {
@@ -208,18 +269,34 @@ async function adminLogin() {
   // Re-fetch accounts in case they changed since page load
   if (!ADMIN_ACCOUNTS.length) ADMIN_ACCOUNTS = await db_getAdmins();
 
-  const account = ADMIN_ACCOUNTS.find(a => a.username === u && a.password === p && a.role === r);
+  // Hash the entered password before comparing.
+  // Existing plain-text passwords in ljm_admins will need to be replaced
+  // with their SHA-256 equivalents in the DB (see migration note below).
+  // During migration you can compare both forms so no-one is locked out.
+  const hashed  = await sha256(p);
+  const account = ADMIN_ACCOUNTS.find(a => {
+    if (a.username !== u || a.role !== r) return false;
+    // Accept hashed match (new rows) OR plain-text match (legacy rows)
+    // so existing seed data keeps working until the DB is migrated.
+    return a.password === hashed || a.password === p;
+  });
+
   if (!account) { document.getElementById('login-error').classList.remove('hidden'); return; }
   document.getElementById('login-error').classList.add('hidden');
 
+  _setSession(account);
   currentAdmin = account;
+
   document.getElementById('login-screen').classList.remove('active');
   const app = document.getElementById('admin-app');
   app.classList.remove('admin-app-hidden');
   app.classList.add('admin-app-visible');
   document.getElementById('admin-avatar').textContent       = account.name[0];
   document.getElementById('admin-name-display').textContent = account.name;
-  document.getElementById('admin-role-display').textContent = account.role;
+  document.getElementById('admin-role-display').textContent = account.role.toUpperCase();
+
+  // Apply role-based nav visibility
+  applyRBAC(account.role);
 
   await loadOrders();
   await loadAdminProducts();
@@ -227,15 +304,20 @@ async function adminLogin() {
   filteredFeedbacks = [...allFeedbacks];
   allPayments = await db_getPayments();
 
-  showPage('dashboard', document.querySelector('.nav-item'));
+  // Navigate to first allowed page for this role
+  const firstPage = ROLE_PAGES[account.role]?.[0] || 'dashboard';
+  showPage(firstPage, null);
   startSync();
 }
 
 function adminLogout() {
+  _clearSession();
   currentAdmin = null;
   document.getElementById('admin-app').classList.add('admin-app-hidden');
   document.getElementById('admin-app').classList.remove('admin-app-visible');
   document.getElementById('login-screen').classList.add('active');
+  // Restore all nav items so the next login renders them correctly
+  document.querySelectorAll('.nav-item[onclick]').forEach(i => i.style.display = '');
 }
 
 function togglePw() {
@@ -247,6 +329,10 @@ function togglePw() {
 //  NAVIGATION
 // ══════════════════════════════════════════════════════════
 function showPage(name, el) {
+  // RBAC: silently redirect to dashboard if this role can't access the page
+  const role    = currentAdmin?.role || 'staff';
+  const allowed = ROLE_PAGES[role] || ['dashboard'];
+  if (!allowed.includes(name)) { name = 'dashboard'; el = null; }
   document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
   document.getElementById('page-' + name)?.classList.add('active');
   document.querySelectorAll('.nav-item').forEach(i => i.classList.remove('active'));

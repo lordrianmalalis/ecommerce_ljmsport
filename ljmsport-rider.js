@@ -223,7 +223,11 @@ async function loadCompletedDeliveries() {
   const orders = await db_getOrders();
   completedDeliveries = orders
     .filter(o => o.riderId === rider?.id && o.status === 'delivered')
-    .map(o => ({ ...o, fee: Math.round((o.total || 0) * 0.08), completedAt: o.date }));
+    .map(o => ({
+      ...o,
+      fee        : Math.round((o.total || 0) * 0.08),
+      completedAt: o.deliveredAt || o.date,   // prefer explicit deliveredAt; fall back to order date
+    }));
 }
 
 // ════════════════════════════════════════════════════════
@@ -350,7 +354,11 @@ async function onOrdersChange(payload) {
     if (live && live.status === 'delivered') {
       const entry = activeOrders[orderId];
       const fee = Math.round((entry.order.total || 0) * 0.08);
-      completedDeliveries.push({ ...entry.order, fee, completedAt: new Date().toISOString() });
+      completedDeliveries.push({
+        ...entry.order,
+        fee,
+        completedAt: live.deliveredAt || new Date().toISOString(),
+      });
       delete activeOrders[orderId];
       renderActive(); renderHistory(); renderEarnings(); refreshQueue();
       refreshMapLive();
@@ -535,6 +543,7 @@ async function acceptOrder(orderId) {
   const changes = {
     status: 'out_for_delivery', riderId: rider.id,
     riderName: rider.name, riderPhone: rider.phone, riderPlate: rider.plate,
+    shippedAt: new Date().toISOString(),   // ← timestamp when rider picks up
   };
   await db_updateOrder(orderId, changes);
   activeOrders[orderId] = { order: { ...o, ...changes }, step: 0 };
@@ -1223,8 +1232,9 @@ async function submitProofAndComplete() {
   if (!proofOrderId || !activeOrders[proofOrderId]) { closeProofModal(); return; }
   const entry = activeOrders[proofOrderId];
   const fee   = Math.round((entry.order.total || 0) * 0.08);
-  await db_updateOrder(proofOrderId, { status: 'delivered', deliveryPhoto: proofPhotoData });
-  completedDeliveries.push({ ...entry.order, fee, completedAt: new Date().toISOString(), deliveryPhoto: proofPhotoData });
+  const deliveredAt = new Date().toISOString();
+  await db_updateOrder(proofOrderId, { status: 'delivered', deliveryPhoto: proofPhotoData, deliveredAt });
+  completedDeliveries.push({ ...entry.order, fee, completedAt: deliveredAt, deliveryPhoto: proofPhotoData });
   delete activeOrders[proofOrderId];
   const nextId = Object.keys(activeOrders)[0] || null;
   await db_setRiderOrder(rider.id, nextId);

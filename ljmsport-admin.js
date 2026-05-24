@@ -64,6 +64,27 @@ window.addEventListener('DOMContentLoaded', async () => {
   // Pre-load admin accounts from Supabase so login works immediately
   ADMIN_ACCOUNTS = await db_getAdmins();
   startClock();
+
+  // Restore session if the page was refreshed
+  const saved = getSession();
+  if (saved) {
+    currentAdmin = saved;
+    document.getElementById('login-screen').classList.remove('active');
+    const app = document.getElementById('admin-app');
+    app.classList.remove('admin-app-hidden');
+    app.classList.add('admin-app-visible');
+    document.getElementById('admin-avatar').textContent       = saved.name[0];
+    document.getElementById('admin-name-display').textContent = saved.name;
+    document.getElementById('admin-role-display').textContent = saved.role.toUpperCase();
+    applyRBAC(saved.role);
+    await loadOrders();
+    await loadAdminProducts();
+    allFeedbacks = await db_getFeedbacks();
+    filteredFeedbacks = [...allFeedbacks];
+    allPayments = await db_getPayments();
+    showPage('dashboard', null);
+    startSync();
+  }
 });
 
 // ══════════════════════════════════════════════════════════
@@ -204,27 +225,32 @@ function flashNewOrderBanner(count) {
 }
 
 // ══════════════════════════════════════════════════════════
-//  SESSION (in-memory only — no localStorage, no JWTs stored)
-//  A lightweight session object with a hard expiry timestamp.
-//  If the tab is idle past SESSION_TTL_MS the next action that
-//  calls requireAuth() will force a logout automatically.
+//  SESSION (sessionStorage — survives refresh, clears on tab close)
+//  sessionStorage is scoped to the tab and never shared across
+//  tabs or persisted after the browser session ends, making it
+//  more appropriate than localStorage for admin auth state.
 // ══════════════════════════════════════════════════════════
+const SESSION_KEY    = 'ljm_admin_session';
 const SESSION_TTL_MS = 8 * 60 * 60 * 1000; // 8 hours
-let _session = null; // { admin, expiresAt }
 
 function _setSession(account) {
-  _session = { admin: account, expiresAt: Date.now() + SESSION_TTL_MS };
+  const session = { admin: account, expiresAt: Date.now() + SESSION_TTL_MS };
+  sessionStorage.setItem(SESSION_KEY, JSON.stringify(session));
 }
 
 function _clearSession() {
-  _session = null;
+  sessionStorage.removeItem(SESSION_KEY);
 }
 
 /** Returns the current admin if session is still valid, otherwise null. */
 function getSession() {
-  if (!_session) return null;
-  if (Date.now() > _session.expiresAt) { _clearSession(); return null; }
-  return _session.admin;
+  try {
+    const raw = sessionStorage.getItem(SESSION_KEY);
+    if (!raw) return null;
+    const session = JSON.parse(raw);
+    if (Date.now() > session.expiresAt) { _clearSession(); return null; }
+    return session.admin;
+  } catch { _clearSession(); return null; }
 }
 
 /** Call at the start of any privileged operation. Auto-logs out if expired. */
